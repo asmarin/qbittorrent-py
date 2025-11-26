@@ -1,60 +1,121 @@
 name: Build & Push qBittorrent Custom
 
 on:
-  # Se ejecuta cuando haces push a la rama main
   push:
     branches: [ "main" ]
-  # Se ejecuta automáticamente a las 3:00 AM UTC todos los días
   schedule:
-    - cron: '0 3 * * *'
-  # Te permite ejecutarlo manualmente desde la pestaña Actions si lo necesitas
+    # 02:00 UTC = 03:00 AM España (Invierno) / 04:00 AM (Verano)
+    - cron: '0 2 * * *'
   workflow_dispatch:
 
 env:
-  # CAMBIA ESTO por tu usuario/imagen de Docker Hub
   DOCKER_IMAGE_NAME: erchache2000/qbittorrent-py
-  # Esto usa el nombre de tu repo para GHCR automáticamente
+  # Nota: github.repository suele incluir el usuario (ej: tu-usuario/tu-repo)
   GHCR_IMAGE_NAME: ghcr.io/${{ github.repository }}
 
 jobs:
+  # TRABAJO 1: Verificación de cambios en upstream
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check_decision.outputs.should_build }}
+      base_digest: ${{ steps.get_digest.outputs.digest }}
+    steps:
+      - name: ⚙️ Checkout
+        uses: actions/checkout@v4
+
+      - name: 🔍 Obtener Imagen Base y Digest Remoto
+        id: get_digest
+        run: |
+          # Busca la línea FROM en tu Dockerfile
+          BASE_IMAGE=$(grep -m 1 '^FROM' Dockerfile | awk '{print $2}')
+          echo "Imagen base detectada: $BASE_IMAGE"
+          
+          # Obtiene el hash (digest) actual de esa imagen en Docker Hub
+          DIGEST=$(skopeo inspect docker://$BASE_IMAGE --format '{{.Digest}}')
+          echo "Digest remoto actual: $DIGEST"
+          echo "digest=$DIGEST" >> $GITHUB_OUTPUT
+
+      - name: 🧠 Decidir si construir
+        id: check_decision
+        env:
+          # Usamos tu imagen en GHCR para comprobar la última versión que construiste
+          GH_REGISTRY: ${{ env.GHCR_IMAGE_NAME }}:latest
+        run: |
+          # 1. Si NO es schedule (es push manual), construimos siempre
+          if [[ "${{ github.event_name }}" != "schedule" ]]; then
+            echo "Evento manual o push. Forzando construcción."
+            echo "should_build=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # 2. Si es SCHEDULE, comparamos
+          echo "Evento programado. Verificando si la base ha cambiado..."
+          
+          # Intentamos leer la etiqueta 'base_image_digest' de TU última imagen
+          # Si la imagen no existe (primera vez), devuelve 'none'
+          LAST_BASE_DIGEST=$(skopeo inspect docker://$GH_REGISTRY --format '{{.Labels.base_image_digest}}' || echo "none")
+          CURRENT_BASE_DIGEST="${{ steps.get_digest.outputs.digest }}"
+
+          if [[ "$LAST_BASE_DIGEST" == "$CURRENT_BASE_DIGEST" ]]; then
+            echo "🛑 La imagen base no ha cambiado. Saltando build."
+            echo "should_build=false" >> $GITHUB_OUTPUT
+          else
+            echo "🚀 Nueva imagen base detectada. Construyendo actualización."
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          fi
+
+  # TRABAJO 2: Construir y Subir (Solo si check es true)
   build-and-push:
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write # Necesario para subir a GHCR
+      packages: write
 
     steps:
-      - name: Checkout del código
+      - name: ⚙️ Checkout del código
         uses: actions/checkout@v4
 
-      - name: Configurar Docker Buildx
+      - name: 🛠️ Configurar Docker Buildx
         uses: docker/setup-buildx-action@v3
         
-      # Login en Docker Hub
-      - name: Login en Docker Hub
+      - name: 🔒 Login en Docker Hub
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      # Login en GitHub Container Registry
-      - name: Login en GHCR
+      - name: 🔒 Login en GHCR
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GHCR_TAG }}
+          password: ${{ secrets.GHCR_TAG }} # Mantenemos tu nombre de secreto original
 
-      # Construcción y Push
-      - name: Build and push
+      # Genera tags automáticamente (latest, fecha, sha)
+      - name: 🏷️ Definir Tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ env.DOCKER_IMAGE_NAME }}
+            ${{ env.GHCR_IMAGE_NAME }}
+          tags: |
+            type=schedule,pattern={{date 'YYYYMMDD'}}
+            type=raw,value=latest
+            type=sha,format=short
+
+      - name: 🏗️ Construir y Subir
         uses: docker/build-push-action@v5
         with:
           context: .
           push: true
-          # IMPORTANTE: pull: true fuerza a buscar actualizaciones de la imagen base (linuxserver)
-          pull: true 
-          tags: |
-            ${{ env.DOCKER_IMAGE_NAME }}:latest
-            ${{ env.GHCR_IMAGE_NAME }}:latest
-          # RHEL 9 x64 es amd64. Si usaras Raspberry Pi añadirías linux/arm64
+          pull: true # Fuerza buscar actualizaciones de la base durante el build
+          tags: ${{ steps.meta.outputs.tags }}
           platforms: linux/amd64
+          # Inyectamos el digest de la base como etiqueta para la próxima comprobación
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            base_image_digest=${{ needs.check.outputs.base_digest }}
