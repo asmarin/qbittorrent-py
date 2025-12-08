@@ -10,9 +10,7 @@ on:
 
 env:
   DOCKER_IMAGE_NAME: erchache2000/qbittorrent-py
-  # Nota: github.repository suele incluir el usuario (ej: tu-usuario/tu-repo)
-  GHCR_IMAGE_NAME: ghcr.io/${{ github.repository }}
-
+  DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
 jobs:
   # TRABAJO 1: Verificación de cambios en upstream
   check:
