@@ -10,6 +10,7 @@ on:
 
 env:
   DOCKER_IMAGE_NAME: erchache2000/qbittorrent-py
+  GHCR_IMAGE_NAME: ghcr.io/${{ github.repository }}
   DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
 jobs:
   # TRABAJO 1: Verificación de cambios en upstream
