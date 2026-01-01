@@ -12,6 +12,7 @@ env:
   DOCKER_IMAGE_NAME: erchache2000/qbittorrent-py
   GHCR_IMAGE_NAME: ghcr.io/${{ github.repository }}
   DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+
 jobs:
   # TRABAJO 1: Verificación de cambios en upstream
   check:
@@ -26,35 +27,33 @@ jobs:
       - name: 🔍 Obtener Imagen Base y Digest Remoto
         id: get_digest
         run: |
-          # Busca la línea FROM en tu Dockerfile
           BASE_IMAGE=$(grep -m 1 '^FROM' Dockerfile | awk '{print $2}')
           echo "Imagen base detectada: $BASE_IMAGE"
-          
-          # Obtiene el hash (digest) actual de esa imagen en Docker Hub
           DIGEST=$(skopeo inspect docker://$BASE_IMAGE --format '{{.Digest}}')
           echo "Digest remoto actual: $DIGEST"
           echo "digest=$DIGEST" >> $GITHUB_OUTPUT
 
+      - name: 🔒 Login para skopeo en GHCR
+        run: |
+          echo "${{ secrets.GHCR_TAG }}" | skopeo login ghcr.io --username ${{ github.actor }} --password-stdin
+
       - name: 🧠 Decidir si construir
         id: check_decision
         env:
-          # Usamos tu imagen en GHCR para comprobar la última versión que construiste
           GH_REGISTRY: ${{ env.GHCR_IMAGE_NAME }}:latest
         run: |
-          # 1. Si NO es schedule (es push manual), construimos siempre
           if [[ "${{ github.event_name }}" != "schedule" ]]; then
             echo "Evento manual o push. Forzando construcción."
             echo "should_build=true" >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          # 2. Si es SCHEDULE, comparamos
           echo "Evento programado. Verificando si la base ha cambiado..."
-          
-          # Intentamos leer la etiqueta 'base_image_digest' de TU última imagen
-          # Si la imagen no existe (primera vez), devuelve 'none'
-          LAST_BASE_DIGEST=$(skopeo inspect docker://$GH_REGISTRY --format '{{.Labels.base_image_digest}}' || echo "none")
+          LAST_BASE_DIGEST=$(skopeo inspect --creds "${{ github.actor }}:${{ secrets.GHCR_TAG }}" docker://$GH_REGISTRY --format '{{.Labels.base_image_digest}}' || echo "none")
           CURRENT_BASE_DIGEST="${{ steps.get_digest.outputs.digest }}"
+
+          echo "Último digest en GHCR: $LAST_BASE_DIGEST"
+          echo "Digest actual de la base: $CURRENT_BASE_DIGEST"
 
           if [[ "$LAST_BASE_DIGEST" == "$CURRENT_BASE_DIGEST" ]]; then
             echo "🛑 La imagen base no ha cambiado. Saltando build."
@@ -91,9 +90,8 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GHCR_TAG }} # Mantenemos tu nombre de secreto original
+          password: ${{ secrets.GHCR_TAG }}
 
-      # Genera tags automáticamente (latest, fecha, sha)
       - name: 🏷️ Definir Tags
         id: meta
         uses: docker/metadata-action@v5
@@ -111,10 +109,9 @@ jobs:
         with:
           context: .
           push: true
-          pull: true # Fuerza buscar actualizaciones de la base durante el build
+          pull: true
           tags: ${{ steps.meta.outputs.tags }}
           platforms: linux/amd64
-          # Inyectamos el digest de la base como etiqueta para la próxima comprobación
           labels: |
             ${{ steps.meta.outputs.labels }}
             base_image_digest=${{ needs.check.outputs.base_digest }}
