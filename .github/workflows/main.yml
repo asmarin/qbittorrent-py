@@ -11,36 +11,36 @@ on:
 env:
   DOCKER_IMAGE_NAME: erchache2000/qbittorrent-py
   GHCR_IMAGE_NAME: ghcr.io/${{ github.repository }}
-  DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
 
 jobs:
-  # TRABAJO 1: Verificación de cambios en upstream
   check:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
     outputs:
       should_build: ${{ steps.check_decision.outputs.should_build }}
-      base_digest: ${{ steps.get_digest.outputs.digest }}
+      base_digest: ${{ steps.get_upstream.outputs.base_digest }}
+      plugins_sha: ${{ steps.get_upstream.outputs.plugins_sha }}
     steps:
-      - name: ⚙️ Checkout
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: 🔍 Obtener Imagen Base y Digest Remoto
-        id: get_digest
+      - name: Obtener Digest Base y Commit de Plugins
+        id: get_upstream
         run: |
           BASE_IMAGE=$(grep -m 1 '^FROM' Dockerfile | awk '{print $2}')
-          echo "Imagen base detectada: $BASE_IMAGE"
-          DIGEST=$(skopeo inspect docker://$BASE_IMAGE --format '{{.Digest}}')
-          echo "Digest remoto actual: $DIGEST"
-          echo "digest=$DIGEST" >> $GITHUB_OUTPUT
+          BASE_DIGEST=$(skopeo inspect --override-arch amd64 --override-os linux docker://$BASE_IMAGE --format '{{.Digest}}')
+          PLUGINS_SHA=$(curl -fsSL -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            https://api.github.com/repos/qbittorrent/search-plugins/commits/master | jq -r '.sha')
 
-      - name: 🔒 Login para skopeo en GHCR
-        run: |
-          echo "${{ secrets.GHCR_TAG }}" | skopeo login ghcr.io --username ${{ github.actor }} --password-stdin
+          echo "Base digest: $BASE_DIGEST"
+          echo "Plugins SHA: $PLUGINS_SHA"
+          echo "base_digest=$BASE_DIGEST" >> $GITHUB_OUTPUT
+          echo "plugins_sha=$PLUGINS_SHA" >> $GITHUB_OUTPUT
 
-      - name: 🧠 Decidir si construir
+      - name: Decidir si construir
         id: check_decision
-        env:
-          GH_REGISTRY: ${{ env.GHCR_IMAGE_NAME }}:latest
         run: |
           if [[ "${{ github.event_name }}" != "schedule" ]]; then
             echo "Evento manual o push. Forzando construcción."
@@ -48,22 +48,23 @@ jobs:
             exit 0
           fi
 
-          echo "Evento programado. Verificando si la base ha cambiado..."
-          LAST_BASE_DIGEST=$(skopeo inspect --creds "${{ github.actor }}:${{ secrets.GHCR_TAG }}" docker://$GH_REGISTRY --format '{{.Labels.base_image_digest}}' || echo "none")
-          CURRENT_BASE_DIGEST="${{ steps.get_digest.outputs.digest }}"
+          GH_REGISTRY="${GHCR_IMAGE_NAME,,}:latest"
+          INSPECT_JSON=$(skopeo inspect --creds "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" docker://$GH_REGISTRY 2>/dev/null || echo "{}")
 
-          echo "Último digest en GHCR: $LAST_BASE_DIGEST"
-          echo "Digest actual de la base: $CURRENT_BASE_DIGEST"
+          LAST_BASE=$(echo "$INSPECT_JSON" | jq -r '.Labels.base_image_digest // "none"')
+          LAST_PLUGINS=$(echo "$INSPECT_JSON" | jq -r '.Labels.plugins_commit // "none"')
 
-          if [[ "$LAST_BASE_DIGEST" == "$CURRENT_BASE_DIGEST" ]]; then
-            echo "🛑 La imagen base no ha cambiado. Saltando build."
+          CURRENT_BASE="${{ steps.get_upstream.outputs.base_digest }}"
+          CURRENT_PLUGINS="${{ steps.get_upstream.outputs.plugins_sha }}"
+
+          if [[ "$LAST_BASE" == "$CURRENT_BASE" && "$LAST_PLUGINS" == "$CURRENT_PLUGINS" ]]; then
+            echo "Sin cambios en imagen base ni en plugins. Saltando build."
             echo "should_build=false" >> $GITHUB_OUTPUT
           else
-            echo "🚀 Nueva imagen base detectada. Construyendo actualización."
+            echo "Actualización detectada. Construyendo nueva imagen."
             echo "should_build=true" >> $GITHUB_OUTPUT
           fi
 
-  # TRABAJO 2: Construir y Subir (Solo si check es true)
   build-and-push:
     needs: check
     if: needs.check.outputs.should_build == 'true'
@@ -71,28 +72,27 @@ jobs:
     permissions:
       contents: read
       packages: write
-
     steps:
-      - name: ⚙️ Checkout del código
+      - name: Checkout del código
         uses: actions/checkout@v4
 
-      - name: 🛠️ Configurar Docker Buildx
+      - name: Configurar Docker Buildx
         uses: docker/setup-buildx-action@v3
-        
-      - name: 🔒 Login en Docker Hub
+
+      - name: Login en Docker Hub
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: 🔒 Login en GHCR
+      - name: Login en GHCR
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GHCR_TAG }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 🏷️ Definir Tags
+      - name: Definir Tags
         id: meta
         uses: docker/metadata-action@v5
         with:
@@ -104,14 +104,16 @@ jobs:
             type=raw,value=latest
             type=sha,format=short
 
-      - name: 🏗️ Construir y Subir
+      - name: Construir y Subir
         uses: docker/build-push-action@v5
         with:
           context: .
           push: true
           pull: true
+          provenance: false
           tags: ${{ steps.meta.outputs.tags }}
           platforms: linux/amd64
           labels: |
             ${{ steps.meta.outputs.labels }}
             base_image_digest=${{ needs.check.outputs.base_digest }}
+            plugins_commit=${{ needs.check.outputs.plugins_sha }}
